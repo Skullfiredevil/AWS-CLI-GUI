@@ -3,7 +3,9 @@ from tkinter import ttk, messagebox, filedialog
 import subprocess
 import json
 import os
+import threading
 from utils.aws_utils import run_aws_command, run_command_async, batch_process, clear_caches
+from services.custom_drag_drop import CustomDragDrop
 
 class S3Service:
     def __init__(self, parent):
@@ -17,6 +19,9 @@ class S3Service:
         self.current_bucket = None
         self.current_prefix = ""
         self.objects = []
+        
+        # Initialize custom drag and drop handler
+        self.drag_drop_handler = CustomDragDrop(parent, self)
     
     def create_widgets(self):
         # Create a frame for the bucket list

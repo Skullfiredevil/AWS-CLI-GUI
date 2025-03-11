@@ -12,6 +12,7 @@ import threading
 from services.s3_service import S3Service
 from services.ec2_service import EC2Service
 from services.iam_service import IAMService
+from services.wizard_service import WizardService
 from utils.aws_utils import run_aws_command, run_command_async, get_aws_config
 
 class AwsCliGui:
@@ -38,11 +39,13 @@ class AwsCliGui:
         self.s3_service = S3Service(self.notebook)
         self.ec2_service = EC2Service(self.notebook)
         self.iam_service = IAMService(self.notebook)
+        self.wizard_service = WizardService(self.notebook)
         
         # Add tabs to the notebook
         self.notebook.add(self.s3_service.frame, text="S3")
         self.notebook.add(self.ec2_service.frame, text="EC2")
         self.notebook.add(self.iam_service.frame, text="IAM")
+        self.notebook.add(self.wizard_service.frame, text="Wizards")
         
         # Create a status bar
         self.status_bar = ttk.Label(self.root, text="Ready", anchor=tk.W)
