@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import subprocess
 import json
 import os
+from utils.aws_utils import run_aws_command, run_command_async, batch_process, clear_caches
 
 class EC2Service:
     def __init__(self, parent):
@@ -74,19 +75,12 @@ class EC2Service:
     
     def list_instances(self):
         try:
-            # Run AWS CLI command to list instances
-            result = subprocess.run(
-                ["aws", "ec2", "describe-instances"],
-                capture_output=True,
-                text=True
-            )
+            # Run AWS CLI command to list instances with caching
+            success, data = run_aws_command(['ec2', 'describe-instances'], use_cache=True)
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list instances: {result.stderr}")
+            if not success:
+                messagebox.showerror("Error", f"Failed to list instances: {data}")
                 return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
             
             # Clear the treeview
             for item in self.instance_tree.get_children():
@@ -358,21 +352,43 @@ class EC2Service:
             return
         
         instance_id = self.selected_instance.get("InstanceId")
+        if not instance_id:
+            return
+        
+        # Confirm action
+        if not messagebox.askyesno("Confirm", f"Are you sure you want to start instance {instance_id}?"):
+            return
+        
+        # Create a status dialog
+        status_window = tk.Toplevel(self.parent)
+        status_window.title("Starting Instance")
+        status_window.geometry("300x100")
+        status_window.transient(self.parent)
+        status_window.grab_set()
+        
+        ttk.Label(status_window, text=f"Starting instance {instance_id}...").pack(pady=10)
+        status_var = tk.StringVar(value="Sending start command...")
+        ttk.Label(status_window, textvariable=status_var).pack(pady=5)
+        
+        def start_complete(success, data):
+            status_window.destroy()
+            if not success:
+                messagebox.showerror("Error", f"Failed to start instance: {data}")
+            else:
+                messagebox.showinfo("Success", f"Instance {instance_id} is starting")
+                # Refresh the instance list
+                self.list_instances()
         
         try:
-            # Run AWS CLI command to start instance
-            result = subprocess.run(
-                ["aws", "ec2", "start-instances", "--instance-ids", instance_id],
-                capture_output=True,
-                text=True
-            )
+            # Run AWS CLI command to start instance asynchronously
+            command = ['ec2', 'start-instances', '--instance-ids', instance_id]
+            run_command_async(command, callback=start_complete)
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to start instance: {result.stderr}")
-            else:
-                messagebox.showinfo("Success", f"Instance '{instance_id}' is starting")
-                self.list_instances()
+            # Update status message
+            status_var.set("Start command sent. Waiting for response...")
+            
         except Exception as e:
+            status_window.destroy()
             messagebox.showerror("Error", f"Failed to start instance: {e}")
     
     def stop_instance(self):
@@ -380,25 +396,43 @@ class EC2Service:
             return
         
         instance_id = self.selected_instance.get("InstanceId")
-        
-        # Confirm stop
-        if not messagebox.askyesno("Confirm", f"Are you sure you want to stop instance '{instance_id}'?"):
+        if not instance_id:
             return
         
-        try:
-            # Run AWS CLI command to stop instance
-            result = subprocess.run(
-                ["aws", "ec2", "stop-instances", "--instance-ids", instance_id],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to stop instance: {result.stderr}")
+        # Confirm action
+        if not messagebox.askyesno("Confirm", f"Are you sure you want to stop instance {instance_id}?"):
+            return
+        
+        # Create a status dialog
+        status_window = tk.Toplevel(self.parent)
+        status_window.title("Stopping Instance")
+        status_window.geometry("300x100")
+        status_window.transient(self.parent)
+        status_window.grab_set()
+        
+        ttk.Label(status_window, text=f"Stopping instance {instance_id}...").pack(pady=10)
+        status_var = tk.StringVar(value="Sending stop command...")
+        ttk.Label(status_window, textvariable=status_var).pack(pady=5)
+        
+        def stop_complete(success, data):
+            status_window.destroy()
+            if not success:
+                messagebox.showerror("Error", f"Failed to stop instance: {data}")
             else:
-                messagebox.showinfo("Success", f"Instance '{instance_id}' is stopping")
+                messagebox.showinfo("Success", f"Instance {instance_id} is stopping")
+                # Refresh the instance list
                 self.list_instances()
+        
+        try:
+            # Run AWS CLI command to stop instance asynchronously
+            command = ['ec2', 'stop-instances', '--instance-ids', instance_id]
+            run_command_async(command, callback=stop_complete)
+            
+            # Update status message
+            status_var.set("Stop command sent. Waiting for response...")
+            
         except Exception as e:
+            status_window.destroy()
             messagebox.showerror("Error", f"Failed to stop instance: {e}")
     
     def terminate_instance(self):

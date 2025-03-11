@@ -6,11 +6,13 @@ import os
 import sys
 import subprocess
 import json
+import threading
 
 # Import service modules
 from services.s3_service import S3Service
 from services.ec2_service import EC2Service
 from services.iam_service import IAMService
+from utils.aws_utils import run_aws_command, run_command_async, get_aws_config
 
 class AwsCliGui:
     def __init__(self, root):
@@ -78,9 +80,9 @@ class AwsCliGui:
             if result.returncode != 0:
                 return False
             
-            # Check if AWS credentials are configured
-            result = subprocess.run(["aws", "sts", "get-caller-identity"], capture_output=True, text=True)
-            return result.returncode == 0
+            # Check if AWS credentials are configured using our utility function
+            success, _ = run_aws_command(['sts', 'get-caller-identity'], use_cache=True)
+            return success
         except Exception as e:
             print(f"Error checking AWS CLI: {e}")
             return False

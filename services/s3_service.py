@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, filedialog
 import subprocess
 import json
 import os
+from utils.aws_utils import run_aws_command, run_command_async, batch_process, clear_caches
 
 class S3Service:
     def __init__(self, parent):
@@ -76,24 +77,21 @@ class S3Service:
     
     def list_buckets(self):
         try:
-            # Run AWS CLI command to list buckets
-            result = subprocess.run(["aws", "s3", "ls"], capture_output=True, text=True)
+            # Run AWS CLI command to list buckets with caching
+            success, data = run_aws_command(['s3api', 'list-buckets'], use_cache=True)
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list buckets: {result.stderr}")
+            if not success:
+                messagebox.showerror("Error", f"Failed to list buckets: {data}")
                 return
             
             # Clear the listbox
             self.bucket_listbox.delete(0, tk.END)
             
             # Parse the output and add buckets to the listbox
-            for line in result.stdout.splitlines():
-                if line.strip():
-                    # Format: YYYY-MM-DD HH:MM:SS bucket-name
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        bucket_name = parts[2]
-                        self.bucket_listbox.insert(tk.END, bucket_name)
+            for bucket in data.get('Buckets', []):
+                bucket_name = bucket.get('Name')
+                if bucket_name:
+                    self.bucket_listbox.insert(tk.END, bucket_name)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list buckets: {e}")
     
@@ -191,26 +189,24 @@ class S3Service:
             return
         
         try:
-            # Run AWS CLI command to list objects
-            cmd = ["aws", "s3api", "list-objects-v2", "--bucket", self.current_bucket]
+            # Build command arguments
+            command = ['s3api', 'list-objects-v2', '--bucket', self.current_bucket]
+            args = []
             
             # Add prefix if not empty
             if self.current_prefix:
-                cmd.extend(["--prefix", self.current_prefix])
+                args.extend(["--prefix", self.current_prefix])
                 # Add delimiter for folder-like behavior
-                cmd.extend(["--delimiter", "/"])
+                args.extend(["--delimiter", "/"])
             else:
-                # Add delimiter for folder-like behavior
-                cmd.extend(["--delimiter", "/"])
+                args.extend(["--delimiter", "/"])
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # Run AWS CLI command to list objects with caching
+            success, data = run_aws_command(command + args, use_cache=True)
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list objects: {result.stderr}")
+            if not success:
+                messagebox.showerror("Error", f"Failed to list objects: {data}")
                 return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
             
             # Clear the treeview
             for item in self.object_tree.get_children():
@@ -297,74 +293,77 @@ class S3Service:
             messagebox.showwarning("Warning", "Please select a bucket first")
             return
         
-        # Open file dialog
+        # Open file dialog to select a file
         file_path = filedialog.askopenfilename(
             title="Select File to Upload",
             filetypes=[("All Files", "*.*")]
         )
         
         if not file_path:
-            return
+            return  # User cancelled
         
-        # Get the file name
+        # Get the file name from the path
         file_name = os.path.basename(file_path)
         
-        # Construct the S3 key
+        # Determine the S3 key (path in the bucket)
         s3_key = self.current_prefix + file_name
         
-        try:
-            # Show progress dialog
-            progress_window = tk.Toplevel(self.parent)
-            progress_window.title("Uploading File")
-            progress_window.geometry("300x100")
-            progress_window.transient(self.parent)
-            progress_window.grab_set()
-            
-            ttk.Label(progress_window, text=f"Uploading {file_name} to {self.current_bucket}").pack(pady=5)
-            progress_bar = ttk.Progressbar(progress_window, mode="indeterminate")
-            progress_bar.pack(fill=tk.X, padx=10, pady=10)
-            progress_bar.start()
-            
-            # Update the UI
-            progress_window.update()
-            
-            # Run AWS CLI command to upload file
-            result = subprocess.run(
-                ["aws", "s3", "cp", file_path, f"s3://{self.current_bucket}/{s3_key}"],
-                capture_output=True,
-                text=True
-            )
-            
-            # Close the progress dialog
+        # Create a progress dialog
+        progress_window = tk.Toplevel(self.parent)
+        progress_window.title("Uploading File")
+        progress_window.geometry("300x100")
+        progress_window.transient(self.parent)
+        progress_window.grab_set()
+        
+        ttk.Label(progress_window, text=f"Uploading {file_name}...").pack(pady=10)
+        progress_var = tk.StringVar(value="Starting upload...")
+        ttk.Label(progress_window, textvariable=progress_var).pack(pady=5)
+        
+        def upload_complete(success, data):
             progress_window.destroy()
-            
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to upload file: {result.stderr}")
+            if not success:
+                messagebox.showerror("Error", f"Failed to upload file: {data}")
             else:
                 messagebox.showinfo("Success", f"File '{file_name}' uploaded successfully")
+                # Refresh the object list
                 self.list_objects()
+        
+        try:
+            # Run AWS CLI command to upload file asynchronously
+            command = ['s3', 'cp', file_path, f"s3://{self.current_bucket}/{s3_key}"]
+            run_command_async(command, json_output=False, callback=upload_complete)
+            
+            # Update progress message
+            progress_var.set("Upload in progress...")
+            
         except Exception as e:
+            progress_window.destroy()
             messagebox.showerror("Error", f"Failed to upload file: {e}")
     
     def download_file(self):
-        # Get the selected item
+        if not self.current_bucket:
+            messagebox.showwarning("Warning", "Please select a bucket first")
+            return
+        
+        # Get the selected object
         selection = self.object_tree.selection()
         if not selection:
             messagebox.showwarning("Warning", "Please select a file to download")
             return
         
+        # Get the object key
         item_id = selection[0]
         file_name = self.object_tree.item(item_id, "text")
         
         # Check if it's a folder
         if file_name.endswith("/"):
-            messagebox.showwarning("Warning", "Cannot download folders")
+            messagebox.showwarning("Warning", "Cannot download folders. Please select a file.")
             return
         
-        # Construct the S3 key
+        # Determine the full S3 key
         s3_key = self.current_prefix + file_name
         
-        # Open save file dialog
+        # Open file dialog to select save location
         save_path = filedialog.asksaveasfilename(
             title="Save File As",
             initialfile=file_name,
@@ -372,39 +371,36 @@ class S3Service:
         )
         
         if not save_path:
-            return
+            return  # User cancelled
         
-        try:
-            # Show progress dialog
-            progress_window = tk.Toplevel(self.parent)
-            progress_window.title("Downloading File")
-            progress_window.geometry("300x100")
-            progress_window.transient(self.parent)
-            progress_window.grab_set()
-            
-            ttk.Label(progress_window, text=f"Downloading {file_name} from {self.current_bucket}").pack(pady=5)
-            progress_bar = ttk.Progressbar(progress_window, mode="indeterminate")
-            progress_bar.pack(fill=tk.X, padx=10, pady=10)
-            progress_bar.start()
-            
-            # Update the UI
-            progress_window.update()
-            
-            # Run AWS CLI command to download file
-            result = subprocess.run(
-                ["aws", "s3", "cp", f"s3://{self.current_bucket}/{s3_key}", save_path],
-                capture_output=True,
-                text=True
-            )
-            
-            # Close the progress dialog
+        # Create a progress dialog
+        progress_window = tk.Toplevel(self.parent)
+        progress_window.title("Downloading File")
+        progress_window.geometry("300x100")
+        progress_window.transient(self.parent)
+        progress_window.grab_set()
+        
+        ttk.Label(progress_window, text=f"Downloading {file_name}...").pack(pady=10)
+        progress_var = tk.StringVar(value="Starting download...")
+        ttk.Label(progress_window, textvariable=progress_var).pack(pady=5)
+        
+        def download_complete(success, data):
             progress_window.destroy()
-            
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to download file: {result.stderr}")
+            if not success:
+                messagebox.showerror("Error", f"Failed to download file: {data}")
             else:
                 messagebox.showinfo("Success", f"File '{file_name}' downloaded successfully")
+        
+        try:
+            # Run AWS CLI command to download file asynchronously
+            command = ['s3', 'cp', f"s3://{self.current_bucket}/{s3_key}", save_path]
+            run_command_async(command, json_output=False, callback=download_complete)
+            
+            # Update progress message
+            progress_var.set("Download in progress...")
+            
         except Exception as e:
+            progress_window.destroy()
             messagebox.showerror("Error", f"Failed to download file: {e}")
     
     def delete_object(self):

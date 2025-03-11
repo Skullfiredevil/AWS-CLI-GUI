@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import subprocess
 import json
 import os
+from utils.aws_utils import run_aws_command, run_command_async, batch_process, clear_caches
 
 class IAMService:
     def __init__(self, parent):
@@ -170,19 +171,12 @@ class IAMService:
     # User operations
     def list_users(self):
         try:
-            # Run AWS CLI command to list users
-            result = subprocess.run(
-                ["aws", "iam", "list-users"],
-                capture_output=True,
-                text=True
-            )
+            # Run AWS CLI command to list users with caching
+            success, data = run_aws_command(['iam', 'list-users'], use_cache=True)
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list users: {result.stderr}")
+            if not success:
+                messagebox.showerror("Error", f"Failed to list users: {data}")
                 return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
             
             # Clear the treeview
             for item in self.users_tree.get_children():
