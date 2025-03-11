@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import subprocess
 import json
 import os
+import threading
 from utils.aws_utils import run_aws_command, run_command_async, batch_process, clear_caches
 
 class IAMService:
@@ -148,6 +149,28 @@ class IAMService:
         ttk.Button(policy_ops_frame, text="Create Policy", command=self.create_policy).pack(side=tk.LEFT, padx=2)
         ttk.Button(policy_ops_frame, text="Delete Policy", command=self.delete_policy).pack(side=tk.LEFT, padx=2)
         
+        # Add filter frame
+        filter_frame = ttk.Frame(policies_list_frame)
+        filter_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(filter_frame, text="Filter:").pack(side=tk.LEFT, padx=2)
+        self.policy_filter_var = tk.StringVar()
+        self.policy_filter_var.trace("w", self.filter_policies)
+        policy_filter_entry = ttk.Entry(filter_frame, textvariable=self.policy_filter_var, width=30)
+        policy_filter_entry.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        
+        # Add filter type options
+        self.filter_type_var = tk.StringVar(value="All")
+        filter_type_frame = ttk.Frame(policies_list_frame)
+        filter_type_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        ttk.Radiobutton(filter_type_frame, text="All", variable=self.filter_type_var, 
+                        value="All", command=self.filter_policies).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(filter_type_frame, text="AWS Managed", variable=self.filter_type_var, 
+                        value="AWS Managed", command=self.filter_policies).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(filter_type_frame, text="Customer Managed", variable=self.filter_type_var, 
+                        value="Customer Managed", command=self.filter_policies).pack(side=tk.LEFT, padx=5)
+        
         # Create a treeview for policies
         self.policies_tree = ttk.Treeview(policies_list_frame, columns=("ARN", "Type"))
         self.policies_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -171,34 +194,46 @@ class IAMService:
     # User operations
     def list_users(self):
         try:
-            # Run AWS CLI command to list users with caching
-            success, data = run_aws_command(['iam', 'list-users'], use_cache=True)
+            # Show loading indicator
+            self.users_tree.insert("", "end", text="Loading...", tags=("loading",))
+            self.users_tree.update()
             
-            if not success:
-                messagebox.showerror("Error", f"Failed to list users: {data}")
-                return
-            
-            # Clear the treeview
-            for item in self.users_tree.get_children():
-                self.users_tree.delete(item)
-            
-            # Reset users list
-            self.users = []
-            
-            # Process the users
-            for user in data.get("Users", []):
-                # Store the user data
-                self.users.append(user)
+            # Run AWS CLI command to list users with caching in a separate thread
+            def fetch_users():
+                success, data = run_aws_command(['iam', 'list-users'], use_cache=True)
                 
-                # Get user properties
-                user_name = user.get("UserName", "")
-                arn = user.get("Arn", "")
-                created = user.get("CreateDate", "")[:10]  # Just the date part
-                
-                # Add to treeview
-                self.users_tree.insert("", "end", text=user_name, values=(arn, created))
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.process_users_data(success, data))
+            
+            # Start the thread
+            threading.Thread(target=fetch_users, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list users: {e}")
+    
+    def process_users_data(self, success, data):
+        # Clear the treeview
+        for item in self.users_tree.get_children():
+            self.users_tree.delete(item)
+        
+        if not success:
+            messagebox.showerror("Error", f"Failed to list users: {data}")
+            return
+        
+        # Reset users list
+        self.users = []
+        
+        # Process the users
+        for user in data.get("Users", []):
+            # Store the user data
+            self.users.append(user)
+            
+            # Get user properties
+            user_name = user.get("UserName", "")
+            arn = user.get("Arn", "")
+            created = user.get("CreateDate", "")[:10]  # Just the date part
+            
+            # Add to treeview
+            self.users_tree.insert("", "end", text=user_name, values=(arn, created))
     
     def on_user_select(self, event):
         # Get the selected item
@@ -232,54 +267,83 @@ class IAMService:
         
         # Clear the text widget
         self.user_details_text.delete(1.0, tk.END)
+        self.user_details_text.insert(tk.END, "Loading user details...")
+        self.user_details_text.config(state=tk.DISABLED)
         
         # Get user name
         user_name = self.selected_user.get("UserName", "")
         
-        try:
-            # Get user details
-            result = subprocess.run(
-                ["aws", "iam", "get-user", "--user-name", user_name],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.user_details_text.insert(tk.END, f"Error getting user details: {result.stderr}")
-                self.user_details_text.config(state=tk.DISABLED)
-                return
-            
-            user_data = json.loads(result.stdout).get("User", {})
-            
-            # Format the user details
-            details = f"User Name: {user_data.get('UserName', 'N/A')}\n"
-            details += f"ARN: {user_data.get('Arn', 'N/A')}\n"
-            details += f"User ID: {user_data.get('UserId', 'N/A')}\n"
-            details += f"Created: {user_data.get('CreateDate', 'N/A')}\n\n"
-            
-            # Get attached policies
-            result = subprocess.run(
-                ["aws", "iam", "list-attached-user-policies", "--user-name", user_name],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                policies_data = json.loads(result.stdout).get("AttachedPolicies", [])
-                details += "Attached Policies:\n"
+        # Fetch user details in a separate thread
+        def fetch_user_details():
+            try:
+                # Get user details with caching
+                success, user_data = run_aws_command(
+                    ['iam', 'get-user'],
+                    args=['--user-name', user_name],
+                    use_cache=True
+                )
                 
-                if policies_data:
-                    for policy in policies_data:
-                        details += f"  - {policy.get('PolicyName', 'N/A')}\n"
-                else:
-                    details += "  No policies attached\n"
+                if not success:
+                    self.parent.after(0, lambda: self.display_user_error(f"Error getting user details: {user_data}"))
+                    return
+                
+                # Get attached policies with caching
+                policies_success, policies_data = run_aws_command(
+                    ['iam', 'list-attached-user-policies'],
+                    args=['--user-name', user_name],
+                    use_cache=True
+                )
+                
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.display_user_details(user_data, policies_success, policies_data))
+            except Exception as e:
+                self.parent.after(0, lambda: self.display_user_error(f"Error: {e}"))
+        
+        # Start the thread
+        threading.Thread(target=fetch_user_details, daemon=True).start()
+    
+    def display_user_details(self, user_data, policies_success, policies_data):
+        # Enable text widget for editing
+        self.user_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget
+        self.user_details_text.delete(1.0, tk.END)
+        
+        # Extract user data
+        user = user_data.get("User", {})
+        
+        # Format the user details
+        details = f"User Name: {user.get('UserName', 'N/A')}\n"
+        details += f"ARN: {user.get('Arn', 'N/A')}\n"
+        details += f"User ID: {user.get('UserId', 'N/A')}\n"
+        details += f"Created: {user.get('CreateDate', 'N/A')}\n\n"
+        
+        # Add policy information
+        details += "Attached Policies:\n"
+        
+        if policies_success:
+            policies = policies_data.get("AttachedPolicies", [])
+            if policies:
+                for policy in policies:
+                    details += f"  - {policy.get('PolicyName', 'N/A')}\n"
             else:
-                details += "  Error getting attached policies\n"
-            
-            # Insert the details
-            self.user_details_text.insert(tk.END, details)
-        except Exception as e:
-            self.user_details_text.insert(tk.END, f"Error: {e}")
+                details += "  No policies attached\n"
+        else:
+            details += "  Error getting attached policies\n"
+        
+        # Insert the details
+        self.user_details_text.insert(tk.END, details)
+        
+        # Disable text widget
+        self.user_details_text.config(state=tk.DISABLED)
+    
+    def display_user_error(self, error_message):
+        # Enable text widget for editing
+        self.user_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget and show error
+        self.user_details_text.delete(1.0, tk.END)
+        self.user_details_text.insert(tk.END, error_message)
         
         # Disable text widget
         self.user_details_text.config(state=tk.DISABLED)
@@ -491,41 +555,46 @@ class IAMService:
     # Role operations
     def list_roles(self):
         try:
-            # Run AWS CLI command to list roles
-            result = subprocess.run(
-                ["aws", "iam", "list-roles"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            self.roles_tree.insert("", "end", text="Loading...", tags=("loading",))
+            self.roles_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list roles: {result.stderr}")
-                return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
-            
-            # Clear the treeview
-            for item in self.roles_tree.get_children():
-                self.roles_tree.delete(item)
-            
-            # Reset roles list
-            self.roles = []
-            
-            # Process the roles
-            for role in data.get("Roles", []):
-                # Store the role data
-                self.roles.append(role)
+            # Run AWS CLI command to list roles with caching in a separate thread
+            def fetch_roles():
+                success, data = run_aws_command(['iam', 'list-roles'], use_cache=True)
                 
-                # Get role properties
-                role_name = role.get("RoleName", "")
-                arn = role.get("Arn", "")
-                created = role.get("CreateDate", "")[:10]  # Just the date part
-                
-                # Add to treeview
-                self.roles_tree.insert("", "end", text=role_name, values=(arn, created))
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.process_roles_data(success, data))
+            
+            # Start the thread
+            threading.Thread(target=fetch_roles, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list roles: {e}")
+    
+    def process_roles_data(self, success, data):
+        # Clear the treeview
+        for item in self.roles_tree.get_children():
+            self.roles_tree.delete(item)
+        
+        if not success:
+            messagebox.showerror("Error", f"Failed to list roles: {data}")
+            return
+        
+        # Reset roles list
+        self.roles = []
+        
+        # Process the roles
+        for role in data.get("Roles", []):
+            # Store the role data
+            self.roles.append(role)
+            
+            # Get role properties
+            role_name = role.get("RoleName", "")
+            arn = role.get("Arn", "")
+            created = role.get("CreateDate", "")[:10]  # Just the date part
+            
+            # Add to treeview
+            self.roles_tree.insert("", "end", text=role_name, values=(arn, created))
     
     def on_role_select(self, event):
         # Get the selected item
@@ -558,54 +627,83 @@ class IAMService:
         
         # Clear the text widget
         self.role_details_text.delete(1.0, tk.END)
+        self.role_details_text.insert(tk.END, "Loading role details...")
+        self.role_details_text.config(state=tk.DISABLED)
         
         # Get role name
         role_name = self.selected_role.get("RoleName", "")
         
-        try:
-            # Get role details
-            result = subprocess.run(
-                ["aws", "iam", "get-role", "--role-name", role_name],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.role_details_text.insert(tk.END, f"Error getting role details: {result.stderr}")
-                self.role_details_text.config(state=tk.DISABLED)
-                return
-            
-            role_data = json.loads(result.stdout).get("Role", {})
-            
-            # Format the role details
-            details = f"Role Name: {role_data.get('RoleName', 'N/A')}\n"
-            details += f"ARN: {role_data.get('Arn', 'N/A')}\n"
-            details += f"Role ID: {role_data.get('RoleId', 'N/A')}\n"
-            details += f"Created: {role_data.get('CreateDate', 'N/A')}\n\n"
-            
-            # Get attached policies
-            result = subprocess.run(
-                ["aws", "iam", "list-attached-role-policies", "--role-name", role_name],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                policies_data = json.loads(result.stdout).get("AttachedPolicies", [])
-                details += "Attached Policies:\n"
+        # Fetch role details in a separate thread
+        def fetch_role_details():
+            try:
+                # Get role details with caching
+                success, role_data = run_aws_command(
+                    ['iam', 'get-role'],
+                    args=['--role-name', role_name],
+                    use_cache=True
+                )
                 
-                if policies_data:
-                    for policy in policies_data:
-                        details += f"  - {policy.get('PolicyName', 'N/A')}\n"
-                else:
-                    details += "  No policies attached\n"
+                if not success:
+                    self.parent.after(0, lambda: self.display_role_error(f"Error getting role details: {role_data}"))
+                    return
+                
+                # Get attached policies with caching
+                policies_success, policies_data = run_aws_command(
+                    ['iam', 'list-attached-role-policies'],
+                    args=['--role-name', role_name],
+                    use_cache=True
+                )
+                
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.display_role_details(role_data, policies_success, policies_data))
+            except Exception as e:
+                self.parent.after(0, lambda: self.display_role_error(f"Error: {e}"))
+        
+        # Start the thread
+        threading.Thread(target=fetch_role_details, daemon=True).start()
+    
+    def display_role_details(self, role_data, policies_success, policies_data):
+        # Enable text widget for editing
+        self.role_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget
+        self.role_details_text.delete(1.0, tk.END)
+        
+        # Extract role data
+        role = role_data.get("Role", {})
+        
+        # Format the role details
+        details = f"Role Name: {role.get('RoleName', 'N/A')}\n"
+        details += f"ARN: {role.get('Arn', 'N/A')}\n"
+        details += f"Role ID: {role.get('RoleId', 'N/A')}\n"
+        details += f"Created: {role.get('CreateDate', 'N/A')}\n\n"
+        
+        # Add policy information
+        details += "Attached Policies:\n"
+        
+        if policies_success:
+            policies = policies_data.get("AttachedPolicies", [])
+            if policies:
+                for policy in policies:
+                    details += f"  - {policy.get('PolicyName', 'N/A')}\n"
             else:
-                details += "  Error getting attached policies\n"
-            
-            # Insert the details
-            self.role_details_text.insert(tk.END, details)
-        except Exception as e:
-            self.role_details_text.insert(tk.END, f"Error: {e}")
+                details += "  No policies attached\n"
+        else:
+            details += "  Error getting attached policies\n"
+        
+        # Insert the details
+        self.role_details_text.insert(tk.END, details)
+        
+        # Disable text widget
+        self.role_details_text.config(state=tk.DISABLED)
+    
+    def display_role_error(self, error_message):
+        # Enable text widget for editing
+        self.role_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget and show error
+        self.role_details_text.delete(1.0, tk.END)
+        self.role_details_text.insert(tk.END, error_message)
         
         # Disable text widget
         self.role_details_text.config(state=tk.DISABLED)
@@ -756,20 +854,38 @@ class IAMService:
         
         # Load policies
         try:
-            result = subprocess.run(
-                ["aws", "iam", "list-policies", "--scope", "All"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            policy_tree.insert("", "end", text="Loading...", tags=("loading",))
+            policy_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list policies: {result.stderr}")
-            else:
-                data = json.loads(result.stdout)
-                for policy in data.get("Policies", []):
-                    policy_name = policy.get("PolicyName", "")
-                    policy_arn = policy.get("Arn", "")
-                    policy_tree.insert("", "end", text=policy_name, values=(policy_arn,))
+            # Load policies in a separate thread
+            def fetch_policies_for_attach():
+                success, data = run_aws_command(
+                    ['iam', 'list-policies'],
+                    args=['--scope', 'All'],
+                    use_cache=True
+                )
+                
+                # Update UI in the main thread
+                def update_policy_tree():
+                    # Clear loading indicator
+                    for item in policy_tree.get_children():
+                        policy_tree.delete(item)
+                    
+                    if not success:
+                        messagebox.showerror("Error", f"Failed to list policies: {data}")
+                        return
+                    
+                    # Add policies to tree
+                    for policy in data.get("Policies", []):
+                        policy_name = policy.get("PolicyName", "")
+                        policy_arn = policy.get("Arn", "")
+                        policy_tree.insert("", "end", text=policy_name, values=(policy_arn,))
+                
+                self.parent.after(0, update_policy_tree)
+            
+            # Start the thread
+            threading.Thread(target=fetch_policies_for_attach, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list policies: {e}")
         
@@ -783,15 +899,16 @@ class IAMService:
             policy_arn = policy_tree.item(item_id, "values")[0]
             
             try:
-                # Run AWS CLI command to attach policy
-                result = subprocess.run(
-                    ["aws", "iam", "attach-role-policy", "--role-name", role_name, "--policy-arn", policy_arn],
-                    capture_output=True,
-                    text=True
+                # Run AWS CLI command to attach policy with caching
+                success, result = run_aws_command(
+                    ['iam', 'attach-role-policy'],
+                    args=['--role-name', role_name, '--policy-arn', policy_arn],
+                    use_cache=False,
+                    json_output=False
                 )
                 
-                if result.returncode != 0:
-                    messagebox.showerror("Error", f"Failed to attach policy: {result.stderr}")
+                if not success:
+                    messagebox.showerror("Error", f"Failed to attach policy: {result}")
                 else:
                     messagebox.showinfo("Success", "Policy attached successfully")
                     dialog.destroy()
@@ -808,41 +925,82 @@ class IAMService:
     # Policy operations
     def list_policies(self):
         try:
-            # Run AWS CLI command to list policies
-            result = subprocess.run(
-                ["aws", "iam", "list-policies", "--scope", "All"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            self.policies_tree.insert("", "end", text="Loading...", tags=("loading",))
+            self.policies_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list policies: {result.stderr}")
-                return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
-            
-            # Clear the treeview
-            for item in self.policies_tree.get_children():
-                self.policies_tree.delete(item)
-            
-            # Reset policies list
-            self.policies = []
-            
-            # Process the policies
-            for policy in data.get("Policies", []):
-                # Store the policy data
-                self.policies.append(policy)
+            # Run AWS CLI command to list policies with caching in a separate thread
+            def fetch_policies():
+                success, data = run_aws_command(
+                    ['iam', 'list-policies'],
+                    args=['--scope', 'All'],
+                    use_cache=True
+                )
                 
-                # Get policy properties
-                policy_name = policy.get("PolicyName", "")
-                arn = policy.get("Arn", "")
-                policy_type = "AWS Managed" if policy.get("IsAttachable") else "Customer Managed"
-                
-                # Add to treeview
-                self.policies_tree.insert("", "end", text=policy_name, values=(arn, policy_type))
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.process_policies_data(success, data))
+            
+            # Start the thread
+            threading.Thread(target=fetch_policies, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list policies: {e}")
+    
+    def process_policies_data(self, success, data):
+        # Clear the treeview
+        for item in self.policies_tree.get_children():
+            self.policies_tree.delete(item)
+        
+        if not success:
+            messagebox.showerror("Error", f"Failed to list policies: {data}")
+            return
+        
+        # Reset policies list
+        self.policies = []
+        
+        # Process the policies
+        for policy in data.get("Policies", []):
+            # Store the policy data
+            self.policies.append(policy)
+            
+            # Get policy properties
+            policy_name = policy.get("PolicyName", "")
+            arn = policy.get("Arn", "")
+            policy_type = "AWS Managed" if policy.get("IsAttachable") else "Customer Managed"
+            
+            # Add to treeview
+            self.policies_tree.insert("", "end", text=policy_name, values=(arn, policy_type))
+        
+        # Apply any existing filter
+        self.filter_policies()
+    
+    def filter_policies(self, *args):
+        # Get the filter text and type
+        filter_text = self.policy_filter_var.get().lower()
+        filter_type = self.filter_type_var.get()
+        
+        # Clear the treeview
+        for item in self.policies_tree.get_children():
+            self.policies_tree.delete(item)
+        
+        # Apply filters
+        for policy in self.policies:
+            # Get policy properties
+            policy_name = policy.get("PolicyName", "").lower()
+            arn = policy.get("Arn", "").lower()
+            description = policy.get("Description", "").lower()
+            policy_type = "AWS Managed" if policy.get("IsAttachable") else "Customer Managed"
+            
+            # Check if policy matches the filter type
+            if filter_type != "All" and policy_type != filter_type:
+                continue
+            
+            # Check if policy matches the filter text
+            if filter_text and not (filter_text in policy_name or filter_text in arn or filter_text in description):
+                continue
+            
+            # Add to treeview
+            self.policies_tree.insert("", "end", text=policy.get("PolicyName", ""), 
+                                     values=(policy.get("Arn", ""), policy_type))
     
     def on_policy_select(self, event):
         # Get the selected item
@@ -873,56 +1031,88 @@ class IAMService:
         
         # Clear the text widget
         self.policy_details_text.delete(1.0, tk.END)
+        self.policy_details_text.insert(tk.END, "Loading policy details...")
+        self.policy_details_text.config(state=tk.DISABLED)
         
-        try:
-            # Get policy version
-            result = subprocess.run(
-                ["aws", "iam", "get-policy", "--policy-arn", policy_arn],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.policy_details_text.insert(tk.END, f"Error getting policy details: {result.stderr}")
-                self.policy_details_text.config(state=tk.DISABLED)
-                return
-            
-            policy_data = json.loads(result.stdout).get("Policy", {})
-            default_version_id = policy_data.get("DefaultVersionId")
-            
-            # Get policy document
-            result = subprocess.run(
-                ["aws", "iam", "get-policy-version", "--policy-arn", policy_arn, "--version-id", default_version_id],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.policy_details_text.insert(tk.END, f"Error getting policy version: {result.stderr}")
-                self.policy_details_text.config(state=tk.DISABLED)
-                return
-            
-            version_data = json.loads(result.stdout).get("PolicyVersion", {})
-            document = version_data.get("Document", {})
-            
-            # Format the policy details
-            details = f"Policy Name: {policy_data.get('PolicyName', 'N/A')}\n"
-            details += f"ARN: {policy_data.get('Arn', 'N/A')}\n"
-            details += f"Description: {policy_data.get('Description', 'N/A')}\n"
-            details += f"Created: {policy_data.get('CreateDate', 'N/A')}\n\n"
-            details += "Policy Document:\n"
-            
-            # Format the JSON document
-            if isinstance(document, dict):
-                document_str = json.dumps(document, indent=2)
-                details += document_str
-            else:
-                details += str(document)
-            
-            # Insert the details
-            self.policy_details_text.insert(tk.END, details)
-        except Exception as e:
-            self.policy_details_text.insert(tk.END, f"Error: {e}")
+        # Fetch policy details in a separate thread
+        def fetch_policy_details():
+            try:
+                # Get policy details with caching
+                success, policy_data = run_aws_command(
+                    ['iam', 'get-policy'],
+                    args=['--policy-arn', policy_arn],
+                    use_cache=True
+                )
+                
+                if not success:
+                    self.parent.after(0, lambda: self.display_policy_error(f"Error getting policy details: {policy_data}"))
+                    return
+                
+                # Extract policy data
+                policy = policy_data.get("Policy", {})
+                default_version_id = policy.get("DefaultVersionId")
+                
+                if not default_version_id:
+                    self.parent.after(0, lambda: self.display_policy_error("Error: Policy has no default version"))
+                    return
+                
+                # Get policy document with caching
+                version_success, version_data = run_aws_command(
+                    ['iam', 'get-policy-version'],
+                    args=['--policy-arn', policy_arn, '--version-id', default_version_id],
+                    use_cache=True
+                )
+                
+                if not version_success:
+                    self.parent.after(0, lambda: self.display_policy_error(f"Error getting policy version: {version_data}"))
+                    return
+                
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.display_policy_details(policy, version_data))
+            except Exception as e:
+                self.parent.after(0, lambda: self.display_policy_error(f"Error: {e}"))
+        
+        # Start the thread
+        threading.Thread(target=fetch_policy_details, daemon=True).start()
+    
+    def display_policy_details(self, policy, version_data):
+        # Enable text widget for editing
+        self.policy_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget
+        self.policy_details_text.delete(1.0, tk.END)
+        
+        # Extract policy version data
+        policy_version = version_data.get("PolicyVersion", {})
+        document = policy_version.get("Document", {})
+        
+        # Format the policy details
+        details = f"Policy Name: {policy.get('PolicyName', 'N/A')}\n"
+        details += f"ARN: {policy.get('Arn', 'N/A')}\n"
+        details += f"Description: {policy.get('Description', 'N/A')}\n"
+        details += f"Created: {policy.get('CreateDate', 'N/A')}\n\n"
+        details += "Policy Document:\n"
+        
+        # Format the JSON document
+        if isinstance(document, dict):
+            document_str = json.dumps(document, indent=2)
+            details += document_str
+        else:
+            details += str(document)
+        
+        # Insert the details
+        self.policy_details_text.insert(tk.END, details)
+        
+        # Disable text widget
+        self.policy_details_text.config(state=tk.DISABLED)
+    
+    def display_policy_error(self, error_message):
+        # Enable text widget for editing
+        self.policy_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget and show error
+        self.policy_details_text.delete(1.0, tk.END)
+        self.policy_details_text.insert(tk.END, error_message)
         
         # Disable text widget
         self.policy_details_text.config(state=tk.DISABLED)
@@ -1056,20 +1246,38 @@ class IAMService:
         
         # Load policies
         try:
-            result = subprocess.run(
-                ["aws", "iam", "list-policies", "--scope", "All"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            policy_tree.insert("", "end", text="Loading...", tags=("loading",))
+            policy_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list policies: {result.stderr}")
-            else:
-                data = json.loads(result.stdout)
-                for policy in data.get("Policies", []):
-                    policy_name = policy.get("PolicyName", "")
-                    policy_arn = policy.get("Arn", "")
-                    policy_tree.insert("", "end", text=policy_name, values=(policy_arn,))
+            # Load policies in a separate thread
+            def fetch_policies_for_attach():
+                success, data = run_aws_command(
+                    ['iam', 'list-policies'],
+                    args=['--scope', 'All'],
+                    use_cache=True
+                )
+                
+                # Update UI in the main thread
+                def update_policy_tree():
+                    # Clear loading indicator
+                    for item in policy_tree.get_children():
+                        policy_tree.delete(item)
+                    
+                    if not success:
+                        messagebox.showerror("Error", f"Failed to list policies: {data}")
+                        return
+                    
+                    # Add policies to tree
+                    for policy in data.get("Policies", []):
+                        policy_name = policy.get("PolicyName", "")
+                        policy_arn = policy.get("Arn", "")
+                        policy_tree.insert("", "end", text=policy_name, values=(policy_arn,))
+                
+                self.parent.after(0, update_policy_tree)
+            
+            # Start the thread
+            threading.Thread(target=fetch_policies_for_attach, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list policies: {e}")
         
@@ -1083,15 +1291,16 @@ class IAMService:
             policy_arn = policy_tree.item(item_id, "values")[0]
             
             try:
-                # Run AWS CLI command to attach policy
-                result = subprocess.run(
-                    ["aws", "iam", "attach-user-policy", "--user-name", user_name, "--policy-arn", policy_arn],
-                    capture_output=True,
-                    text=True
+                # Run AWS CLI command to attach policy with caching
+                success, result = run_aws_command(
+                    ['iam', 'attach-user-policy'],
+                    args=['--user-name', user_name, '--policy-arn', policy_arn],
+                    use_cache=False,
+                    json_output=False
                 )
                 
-                if result.returncode != 0:
-                    messagebox.showerror("Error", f"Failed to attach policy: {result.stderr}")
+                if not success:
+                    messagebox.showerror("Error", f"Failed to attach policy: {result}")
                 else:
                     messagebox.showinfo("Success", "Policy attached successfully")
                     dialog.destroy()
@@ -1128,41 +1337,46 @@ class IAMService:
     # Role operations
     def list_roles(self):
         try:
-            # Run AWS CLI command to list roles
-            result = subprocess.run(
-                ["aws", "iam", "list-roles"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            self.roles_tree.insert("", "end", text="Loading...", tags=("loading",))
+            self.roles_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list roles: {result.stderr}")
-                return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
-            
-            # Clear the treeview
-            for item in self.roles_tree.get_children():
-                self.roles_tree.delete(item)
-            
-            # Reset roles list
-            self.roles = []
-            
-            # Process the roles
-            for role in data.get("Roles", []):
-                # Store the role data
-                self.roles.append(role)
+            # Run AWS CLI command to list roles with caching in a separate thread
+            def fetch_roles():
+                success, data = run_aws_command(['iam', 'list-roles'], use_cache=True)
                 
-                # Get role properties
-                role_name = role.get("RoleName", "")
-                arn = role.get("Arn", "")
-                created = role.get("CreateDate", "")[:10]  # Just the date part
-                
-                # Add to treeview
-                self.roles_tree.insert("", "end", text=role_name, values=(arn, created))
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.process_roles_data(success, data))
+            
+            # Start the thread
+            threading.Thread(target=fetch_roles, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list roles: {e}")
+    
+    def process_roles_data(self, success, data):
+        # Clear the treeview
+        for item in self.roles_tree.get_children():
+            self.roles_tree.delete(item)
+        
+        if not success:
+            messagebox.showerror("Error", f"Failed to list roles: {data}")
+            return
+        
+        # Reset roles list
+        self.roles = []
+        
+        # Process the roles
+        for role in data.get("Roles", []):
+            # Store the role data
+            self.roles.append(role)
+            
+            # Get role properties
+            role_name = role.get("RoleName", "")
+            arn = role.get("Arn", "")
+            created = role.get("CreateDate", "")[:10]  # Just the date part
+            
+            # Add to treeview
+            self.roles_tree.insert("", "end", text=role_name, values=(arn, created))
     
     def on_role_select(self, event):
         # Get the selected item
@@ -1195,54 +1409,83 @@ class IAMService:
         
         # Clear the text widget
         self.role_details_text.delete(1.0, tk.END)
+        self.role_details_text.insert(tk.END, "Loading role details...")
+        self.role_details_text.config(state=tk.DISABLED)
         
         # Get role name
         role_name = self.selected_role.get("RoleName", "")
         
-        try:
-            # Get role details
-            result = subprocess.run(
-                ["aws", "iam", "get-role", "--role-name", role_name],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.role_details_text.insert(tk.END, f"Error getting role details: {result.stderr}")
-                self.role_details_text.config(state=tk.DISABLED)
-                return
-            
-            role_data = json.loads(result.stdout).get("Role", {})
-            
-            # Format the role details
-            details = f"Role Name: {role_data.get('RoleName', 'N/A')}\n"
-            details += f"ARN: {role_data.get('Arn', 'N/A')}\n"
-            details += f"Role ID: {role_data.get('RoleId', 'N/A')}\n"
-            details += f"Created: {role_data.get('CreateDate', 'N/A')}\n\n"
-            
-            # Get attached policies
-            result = subprocess.run(
-                ["aws", "iam", "list-attached-role-policies", "--role-name", role_name],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                policies_data = json.loads(result.stdout).get("AttachedPolicies", [])
-                details += "Attached Policies:\n"
+        # Fetch role details in a separate thread
+        def fetch_role_details():
+            try:
+                # Get role details with caching
+                success, role_data = run_aws_command(
+                    ['iam', 'get-role'],
+                    args=['--role-name', role_name],
+                    use_cache=True
+                )
                 
-                if policies_data:
-                    for policy in policies_data:
-                        details += f"  - {policy.get('PolicyName', 'N/A')}\n"
-                else:
-                    details += "  No policies attached\n"
+                if not success:
+                    self.parent.after(0, lambda: self.display_role_error(f"Error getting role details: {role_data}"))
+                    return
+                
+                # Get attached policies with caching
+                policies_success, policies_data = run_aws_command(
+                    ['iam', 'list-attached-role-policies'],
+                    args=['--role-name', role_name],
+                    use_cache=True
+                )
+                
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.display_role_details(role_data, policies_success, policies_data))
+            except Exception as e:
+                self.parent.after(0, lambda: self.display_role_error(f"Error: {e}"))
+        
+        # Start the thread
+        threading.Thread(target=fetch_role_details, daemon=True).start()
+    
+    def display_role_details(self, role_data, policies_success, policies_data):
+        # Enable text widget for editing
+        self.role_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget
+        self.role_details_text.delete(1.0, tk.END)
+        
+        # Extract role data
+        role = role_data.get("Role", {})
+        
+        # Format the role details
+        details = f"Role Name: {role.get('RoleName', 'N/A')}\n"
+        details += f"ARN: {role.get('Arn', 'N/A')}\n"
+        details += f"Role ID: {role.get('RoleId', 'N/A')}\n"
+        details += f"Created: {role.get('CreateDate', 'N/A')}\n\n"
+        
+        # Add policy information
+        details += "Attached Policies:\n"
+        
+        if policies_success:
+            policies = policies_data.get("AttachedPolicies", [])
+            if policies:
+                for policy in policies:
+                    details += f"  - {policy.get('PolicyName', 'N/A')}\n"
             else:
-                details += "  Error getting attached policies\n"
-            
-            # Insert the details
-            self.role_details_text.insert(tk.END, details)
-        except Exception as e:
-            self.role_details_text.insert(tk.END, f"Error: {e}")
+                details += "  No policies attached\n"
+        else:
+            details += "  Error getting attached policies\n"
+        
+        # Insert the details
+        self.role_details_text.insert(tk.END, details)
+        
+        # Disable text widget
+        self.role_details_text.config(state=tk.DISABLED)
+    
+    def display_role_error(self, error_message):
+        # Enable text widget for editing
+        self.role_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget and show error
+        self.role_details_text.delete(1.0, tk.END)
+        self.role_details_text.insert(tk.END, error_message)
         
         # Disable text widget
         self.role_details_text.config(state=tk.DISABLED)
@@ -1393,20 +1636,38 @@ class IAMService:
         
         # Load policies
         try:
-            result = subprocess.run(
-                ["aws", "iam", "list-policies", "--scope", "All"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            policy_tree.insert("", "end", text="Loading...", tags=("loading",))
+            policy_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list policies: {result.stderr}")
-            else:
-                data = json.loads(result.stdout)
-                for policy in data.get("Policies", []):
-                    policy_name = policy.get("PolicyName", "")
-                    policy_arn = policy.get("Arn", "")
-                    policy_tree.insert("", "end", text=policy_name, values=(policy_arn,))
+            # Load policies in a separate thread
+            def fetch_policies_for_attach():
+                success, data = run_aws_command(
+                    ['iam', 'list-policies'],
+                    args=['--scope', 'All'],
+                    use_cache=True
+                )
+                
+                # Update UI in the main thread
+                def update_policy_tree():
+                    # Clear loading indicator
+                    for item in policy_tree.get_children():
+                        policy_tree.delete(item)
+                    
+                    if not success:
+                        messagebox.showerror("Error", f"Failed to list policies: {data}")
+                        return
+                    
+                    # Add policies to tree
+                    for policy in data.get("Policies", []):
+                        policy_name = policy.get("PolicyName", "")
+                        policy_arn = policy.get("Arn", "")
+                        policy_tree.insert("", "end", text=policy_name, values=(policy_arn,))
+                
+                self.parent.after(0, update_policy_tree)
+            
+            # Start the thread
+            threading.Thread(target=fetch_policies_for_attach, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list policies: {e}")
         
@@ -1420,15 +1681,16 @@ class IAMService:
             policy_arn = policy_tree.item(item_id, "values")[0]
             
             try:
-                # Run AWS CLI command to attach policy
-                result = subprocess.run(
-                    ["aws", "iam", "attach-role-policy", "--role-name", role_name, "--policy-arn", policy_arn],
-                    capture_output=True,
-                    text=True
+                # Run AWS CLI command to attach policy with caching
+                success, result = run_aws_command(
+                    ['iam', 'attach-role-policy'],
+                    args=['--role-name', role_name, '--policy-arn', policy_arn],
+                    use_cache=False,
+                    json_output=False
                 )
                 
-                if result.returncode != 0:
-                    messagebox.showerror("Error", f"Failed to attach policy: {result.stderr}")
+                if not success:
+                    messagebox.showerror("Error", f"Failed to attach policy: {result}")
                 else:
                     messagebox.showinfo("Success", "Policy attached successfully")
                     dialog.destroy()
@@ -1445,41 +1707,82 @@ class IAMService:
     # Policy operations
     def list_policies(self):
         try:
-            # Run AWS CLI command to list policies
-            result = subprocess.run(
-                ["aws", "iam", "list-policies", "--scope", "All"],
-                capture_output=True,
-                text=True
-            )
+            # Show loading indicator
+            self.policies_tree.insert("", "end", text="Loading...", tags=("loading",))
+            self.policies_tree.update()
             
-            if result.returncode != 0:
-                messagebox.showerror("Error", f"Failed to list policies: {result.stderr}")
-                return
-            
-            # Parse the JSON output
-            data = json.loads(result.stdout)
-            
-            # Clear the treeview
-            for item in self.policies_tree.get_children():
-                self.policies_tree.delete(item)
-            
-            # Reset policies list
-            self.policies = []
-            
-            # Process the policies
-            for policy in data.get("Policies", []):
-                # Store the policy data
-                self.policies.append(policy)
+            # Run AWS CLI command to list policies with caching in a separate thread
+            def fetch_policies():
+                success, data = run_aws_command(
+                    ['iam', 'list-policies'],
+                    args=['--scope', 'All'],
+                    use_cache=True
+                )
                 
-                # Get policy properties
-                policy_name = policy.get("PolicyName", "")
-                arn = policy.get("Arn", "")
-                policy_type = "AWS Managed" if policy.get("IsAttachable") else "Customer Managed"
-                
-                # Add to treeview
-                self.policies_tree.insert("", "end", text=policy_name, values=(arn, policy_type))
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.process_policies_data(success, data))
+            
+            # Start the thread
+            threading.Thread(target=fetch_policies, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to list policies: {e}")
+    
+    def process_policies_data(self, success, data):
+        # Clear the treeview
+        for item in self.policies_tree.get_children():
+            self.policies_tree.delete(item)
+        
+        if not success:
+            messagebox.showerror("Error", f"Failed to list policies: {data}")
+            return
+        
+        # Reset policies list
+        self.policies = []
+        
+        # Process the policies
+        for policy in data.get("Policies", []):
+            # Store the policy data
+            self.policies.append(policy)
+            
+            # Get policy properties
+            policy_name = policy.get("PolicyName", "")
+            arn = policy.get("Arn", "")
+            policy_type = "AWS Managed" if policy.get("IsAttachable") else "Customer Managed"
+            
+            # Add to treeview
+            self.policies_tree.insert("", "end", text=policy_name, values=(arn, policy_type))
+        
+        # Apply any existing filter
+        self.filter_policies()
+    
+    def filter_policies(self, *args):
+        # Get the filter text and type
+        filter_text = self.policy_filter_var.get().lower()
+        filter_type = self.filter_type_var.get()
+        
+        # Clear the treeview
+        for item in self.policies_tree.get_children():
+            self.policies_tree.delete(item)
+        
+        # Apply filters
+        for policy in self.policies:
+            # Get policy properties
+            policy_name = policy.get("PolicyName", "").lower()
+            arn = policy.get("Arn", "").lower()
+            description = policy.get("Description", "").lower()
+            policy_type = "AWS Managed" if policy.get("IsAttachable") else "Customer Managed"
+            
+            # Check if policy matches the filter type
+            if filter_type != "All" and policy_type != filter_type:
+                continue
+            
+            # Check if policy matches the filter text
+            if filter_text and not (filter_text in policy_name or filter_text in arn or filter_text in description):
+                continue
+            
+            # Add to treeview
+            self.policies_tree.insert("", "end", text=policy.get("PolicyName", ""), 
+                                     values=(policy.get("Arn", ""), policy_type))
     
     def on_policy_select(self, event):
         # Get the selected item
@@ -1510,56 +1813,88 @@ class IAMService:
         
         # Clear the text widget
         self.policy_details_text.delete(1.0, tk.END)
+        self.policy_details_text.insert(tk.END, "Loading policy details...")
+        self.policy_details_text.config(state=tk.DISABLED)
         
-        try:
-            # Get policy version
-            result = subprocess.run(
-                ["aws", "iam", "get-policy", "--policy-arn", policy_arn],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.policy_details_text.insert(tk.END, f"Error getting policy details: {result.stderr}")
-                self.policy_details_text.config(state=tk.DISABLED)
-                return
-            
-            policy_data = json.loads(result.stdout).get("Policy", {})
-            default_version_id = policy_data.get("DefaultVersionId")
-            
-            # Get policy document
-            result = subprocess.run(
-                ["aws", "iam", "get-policy-version", "--policy-arn", policy_arn, "--version-id", default_version_id],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                self.policy_details_text.insert(tk.END, f"Error getting policy version: {result.stderr}")
-                self.policy_details_text.config(state=tk.DISABLED)
-                return
-            
-            version_data = json.loads(result.stdout).get("PolicyVersion", {})
-            document = version_data.get("Document", {})
-            
-            # Format the policy details
-            details = f"Policy Name: {policy_data.get('PolicyName', 'N/A')}\n"
-            details += f"ARN: {policy_data.get('Arn', 'N/A')}\n"
-            details += f"Description: {policy_data.get('Description', 'N/A')}\n"
-            details += f"Created: {policy_data.get('CreateDate', 'N/A')}\n\n"
-            details += "Policy Document:\n"
-            
-            # Format the JSON document
-            if isinstance(document, dict):
-                document_str = json.dumps(document, indent=2)
-                details += document_str
-            else:
-                details += str(document)
-            
-            # Insert the details
-            self.policy_details_text.insert(tk.END, details)
-        except Exception as e:
-            self.policy_details_text.insert(tk.END, f"Error: {e}")
+        # Fetch policy details in a separate thread
+        def fetch_policy_details():
+            try:
+                # Get policy details with caching
+                success, policy_data = run_aws_command(
+                    ['iam', 'get-policy'],
+                    args=['--policy-arn', policy_arn],
+                    use_cache=True
+                )
+                
+                if not success:
+                    self.parent.after(0, lambda: self.display_policy_error(f"Error getting policy details: {policy_data}"))
+                    return
+                
+                # Extract policy data
+                policy = policy_data.get("Policy", {})
+                default_version_id = policy.get("DefaultVersionId")
+                
+                if not default_version_id:
+                    self.parent.after(0, lambda: self.display_policy_error("Error: Policy has no default version"))
+                    return
+                
+                # Get policy document with caching
+                version_success, version_data = run_aws_command(
+                    ['iam', 'get-policy-version'],
+                    args=['--policy-arn', policy_arn, '--version-id', default_version_id],
+                    use_cache=True
+                )
+                
+                if not version_success:
+                    self.parent.after(0, lambda: self.display_policy_error(f"Error getting policy version: {version_data}"))
+                    return
+                
+                # Update UI in the main thread
+                self.parent.after(0, lambda: self.display_policy_details(policy, version_data))
+            except Exception as e:
+                self.parent.after(0, lambda: self.display_policy_error(f"Error: {e}"))
+        
+        # Start the thread
+        threading.Thread(target=fetch_policy_details, daemon=True).start()
+    
+    def display_policy_details(self, policy, version_data):
+        # Enable text widget for editing
+        self.policy_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget
+        self.policy_details_text.delete(1.0, tk.END)
+        
+        # Extract policy version data
+        policy_version = version_data.get("PolicyVersion", {})
+        document = policy_version.get("Document", {})
+        
+        # Format the policy details
+        details = f"Policy Name: {policy.get('PolicyName', 'N/A')}\n"
+        details += f"ARN: {policy.get('Arn', 'N/A')}\n"
+        details += f"Description: {policy.get('Description', 'N/A')}\n"
+        details += f"Created: {policy.get('CreateDate', 'N/A')}\n\n"
+        details += "Policy Document:\n"
+        
+        # Format the JSON document
+        if isinstance(document, dict):
+            document_str = json.dumps(document, indent=2)
+            details += document_str
+        else:
+            details += str(document)
+        
+        # Insert the details
+        self.policy_details_text.insert(tk.END, details)
+        
+        # Disable text widget
+        self.policy_details_text.config(state=tk.DISABLED)
+    
+    def display_policy_error(self, error_message):
+        # Enable text widget for editing
+        self.policy_details_text.config(state=tk.NORMAL)
+        
+        # Clear the text widget and show error
+        self.policy_details_text.delete(1.0, tk.END)
+        self.policy_details_text.insert(tk.END, error_message)
         
         # Disable text widget
         self.policy_details_text.config(state=tk.DISABLED)
